@@ -59,9 +59,22 @@ b_recon = complex(zeros(num_ascans, signal_length));
         s5 = log_sc_f(s4);                      % Log scale magnitude
         s6 = gs_map_f (s5);
         b_recon(i, :) = s6;
-    end
     toc
+   
 
+    end
+    
+     % Display 
+    figure;
+    %imagesc(20*log10(abs(b_recon +  1e-12)))
+    % threshold = 1e-80;                  % values below this are considered background
+    % b_recon(abs(b_recon) < threshold) = 0;
+    b_recon_smooth = imgaussfilt(abs(b_recon), 0.2); % sigma = 1
+    imagesc((b_recon_smooth).')
+    colormap(gray)
+    title('B scan')
+   
+     
 end
 
 
