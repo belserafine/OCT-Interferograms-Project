@@ -4,7 +4,7 @@ clc; close all; clear;
 
 % Load B-Scan
 jpg_path = "/Users/belindaserafine/Documents/School/Capstone/Capstone Datasets/B-Scans/NEH_UT_2021RetinalOCTDataset/NORMAL/1/OS/000_normal.jpg";
-bscan_name = "000_normal.jpg";
+bscan_name = jpg_path(90:99);
 bscan = imread(jpg_path);
 bscan = im2gray(bscan);
 bscan = double(bscan).'; % transpose to match matrix to image orientation (so we dont have to tranpose the other parameter arrays)
@@ -31,7 +31,7 @@ mybg = round(mybg);
 raw_signals  = complex(zeros(num_ascans, signal_length));
 b_recon = complex(zeros(num_ascans, signal_length));
 
-%% Forward pipeline
+%% Reverse pipeline
 
 for i = 1:num_ascans
     ascan = bscan(i, :);                    % A single A-scan from image
