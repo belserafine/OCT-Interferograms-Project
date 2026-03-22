@@ -1,0 +1,177 @@
+clc; close all; clear;
+
+%% LOAD IMAGE + DEFINE LENGTH
+
+img_path = "/Users/belindaserafine/Documents/School/Capstone/Capstone Datasets/stretched_normal_1_os/000_normal.jpg";
+img = imread(img_path);
+img = im2gray(img);
+bscan = double(img).'; % transpose
+
+bscan = [bscan, conj(flip(bscan, 2))];
+figure;
+imagesc(abs(bscan))
+colormap(gray)
+title("Original B-scan")
+
+
+[num_ascans, num_depth] = size(bscan); % [768x1024]
+signal_length = num_depth;
+
+%% DEFINE SAMPLING GRIDS
+
+tvec = 0:signal_length-1; % 1 x N row vector
+kclk = tvec + (0.05*rand(1,signal_length) - 0.025); % 1 x N
+kclk(1) = 0;
+kclk = round(kclk);
+
+%% OCT PARAMETERS
+maxmin      = [800e-9, 900e-9];
+a_coeffs    = [0, -4 * 10^-11, 0];
+
+%% STORAGE
+og_sig  = zeros(num_ascans, num_depth);
+b_recon = zeros(num_ascans, num_depth);
+mynoise = randn(1, signal_length); % gaussian/white noise with mean = 0, var = 0.01
+mybg = ones(1, signal_length) * mean(bscan, 'all') + mynoise;
+%mybg = zeros(signal_length,1);
+
+%mycp = exp(1i*0.01*pi*rand(1, signal_length))'; % complex phase
+
+
+%% REVERSE PIPELINE (simulate raw from processed image)
+
+for i = 1:num_ascans
+    ascan = bscan(i, :);                    % Real data from image
+    s1 = gs_map_r(ascan);
+    s2 = log_sc_r(s1);                      % Convert mag to log space
+    s3 = fft_r(s2);                         % IFFT to depth domain
+    s4 = disp_c_r(s3, maxmin, a_coeffs);    % Add dispersion
+    s5 = k_lin_r(s4, tvec, kclk);           % Map to nonlinear k-clock
+    s6 = bg_sub_r(s5, mybg);                % Add background
+    og_sig(i, :) = round(s6);
+end
+
+max_val = max(abs(og_sig(:)));
+scale = double(intmax('int32')) / max_val;
+og_sig = og_sig * scale;
+
+%% FORWARD PIPELINE (reconstruct)
+
+for i = 1:num_ascans
+    raw = og_sig(i, :);
+    %s6 = gs_map_f(raw);
+    s7 = bg_sub_f(raw, mybg);               % Remove background
+    s8 = k_lin_f(s7, tvec, kclk);          % Linearize k-space
+    s9 = disp_c_f(s8, maxmin, a_coeffs);   % Correct dispersion
+    s10 = fft_f(s9);                       % FFT to spatial domain
+    s11 = log_sc_f(s10);                   % Log scale magnitude
+    s12 = gs_map_f(s11);
+    b_recon(i, :) = s12;
+end
+
+final_image = b_recon(:, 1:512)';
+
+%% DISPLAY RESULT
+
+figure;
+imagesc(final_image)
+colormap(gray)
+title("Reconstructed B-scan")
+
+figure;
+imagesc(abs(bscan))
+colormap(gray)
+title("Original B-scan")
+
+%% ================== FUNCTIONS =============================
+
+%% -------- GREYSCALE MAPPING --------
+function output = gs_map_r(input)
+    output = input / 255; % normalize to 0-1
+    output = (output * (max(input) - min(input))) + min(input);
+end
+
+function output = gs_map_f(input)
+    output = ((input - min(input)) / (max(input) - min(input))) * 255;
+end
+
+%% -------- BACKGROUND SUBTRACTION (SIMPLE + REVERSIBLE) --------
+function output = bg_sub_f(input, bg)
+    output = input - bg;
+end
+
+function output = bg_sub_r(input, bg)
+    output = input + bg;
+end
+
+%% -------- DISPERSION CORRECTION (COMPLEX + REVERSIBLE) --------
+function output = disp_c_f(input, maxmin, a_coeffs)
+    % Forward: Remove dispersion (multiply by opposite phase)
+    N = length(input);
+    lambda = linspace(maxmin(1), maxmin(2), N);
+    k = 2*pi ./ lambda;
+    k0 = mean(k);
+    phi = a_coeffs(2)*(k-k0).^2 + a_coeffs(3)*(k-k0).^3;
+    output = input .* exp(-1i * phi);
+
+    output = real(output);
+end
+
+function output = disp_c_r(input, maxmin, a_coeffs)
+    % Reverse: Add dispersion (multiply by phase)
+    N = length(input);
+    lambda = linspace(maxmin(1), maxmin(2), N);
+    k = 2*pi ./ lambda;
+    k0 = mean(k);
+    phi = a_coeffs(2)*(k-k0).^2 + a_coeffs(3)*(k-k0).^3;
+    output = input .* exp(1i * phi);
+
+    output = real(output);
+end
+
+%% -------- K-LINEARIZATION (INTERPOLATION) --------
+function output = k_lin_f(nonlinear_y, linear_x, nonlinear_x)
+    % Forward: Map from nonlinear k-clock to linear k-space
+    assert(length(nonlinear_y) == length(nonlinear_x), ...
+        'k_lin_f: signal and source grid must match');
+    output = interp1(nonlinear_x, nonlinear_y, linear_x, 'pchip', 'extrap');
+end
+
+function output = k_lin_r(linear_y, linear_x, nonlinear_x)
+    % Reverse: Map from linear k-space to nonlinear k-clock
+    assert(length(linear_y) == length(linear_x), ...
+        'k_lin_r: signal and source grid must match');
+    output = interp1(linear_x, linear_y, nonlinear_x, 'pchip', 'extrap');
+end
+
+%% -------- FFT (FULL COMPLEX) --------
+function output = fft_f(input)
+    % Forward: FFT to spatial domain
+    output = fft(input);
+    output = abs(output);
+end
+
+function output = fft_r(input)
+    % Reverse: IFFT to k-space domain
+    output = ifft(input, 'symmetric');
+end
+
+%% -------- LOG SCALING (MAGNITUDE ONLY) --------
+function output = log_sc_f(input)
+    % Forward: Convert magnitude to dB scale
+    % Input: complex data from FFT
+    % Output: real dB magnitude (magnitude domain)
+    output = 20*log10(abs(input));
+end
+
+function output = log_sc_r(input)
+    % Reverse: Convert from linear magnitude to complex
+    % Input: real magnitude values (from image)
+    % Output: complex data (assume zero phase initially)
+    % 
+    % Note: If input is already in dB, convert first:
+    output = 10.^(input/20);
+    % If input is linear magnitude:
+    %mag = input;
+    %output = mag + 0i;  % Complex representation with zero phase
+end
