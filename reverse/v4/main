@@ -1,0 +1,53 @@
+%% Setup
+
+clc; close all; clear;
+
+% Setup folder paths and file names
+jpg_folder = '/Users/belindaserafine/Documents/School/Capstone/Capstone Datasets/stretched_normal_1_os';
+first_jpg = '/Users/belindaserafine/Documents/School/Capstone/Capstone Datasets/stretched_normal_1_os/000_normal.jpg';
+
+jpg_struct = fullfile(jpg_folder, '*.jpg');
+jpg_names = dir(jpg_struct);
+
+num_jpgs = length(jpg_names);
+
+% Setup calibration package from first bscan
+first_bscan = imread(first_jpg);
+first_bscan = im2gray(first_bscan);
+first_bscan = double(first_bscan).'; 
+
+first_bscan = [first_bscan, conj(flip(first_bscan, 2))];
+
+[num_ascans, num_depth] = size(first_bscan); % [768x1024]
+signal_length = num_depth;
+
+% Define OCT parameters for s4
+maxmin      = [800e-9, 900e-9];
+a_coeffs    = [0, -4 * 10^-11, 0];
+
+% Define sampling grid for s5
+tvec = 0:signal_length-1; % 1 x N row vector
+kclk = tvec + (0.05*rand(1,signal_length) - 0.025); % 1 x N
+kclk(1) = 0;
+kclk = round(kclk);
+
+% Define background to be subtracted at s6
+mynoise = randn(1, signal_length); % gaussian/white noise with mean = 0, var = 0.01
+mybg = ones(1, signal_length) * mean(first_bscan, 'all') + mynoise;
+mybg = round(mybg);
+
+for i = 1:num_jpgs
+    bscan_name = jpg_names(i).name;
+    jpg_path = fullfile(jpg_folder, bscan_name);
+
+    % Load bscan
+    bscan = imread(jpg_path);
+    bscan = im2gray(bscan);
+    bscan = double(bscan).';
+    
+    bscan = [bscan, conj(flip(bscan, 2))];
+
+    idx = sprintf('%03d', i-1); %000, ..., 0300
+
+    reversebscan(idx, bscan, bscan_name, num_ascans, signal_length, maxmin, a_coeffs, tvec, kclk, mybg);
+end
