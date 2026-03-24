@@ -22,8 +22,8 @@ first_bscan = [first_bscan, conj(flip(first_bscan, 2))];
 signal_length = num_depth;
 
 % Define OCT parameters for s4
-maxmin      = [800e-9, 900e-9];
-a_coeffs    = [0, -4 * 10^-11, 0];
+maxmin      = [770e-9, 935e-9];
+a_coeffs    = [0, -4 * 10^-15, 0];
 
 % Define sampling grid for s5
 tvec = 0:signal_length-1; % 1 x N row vector
