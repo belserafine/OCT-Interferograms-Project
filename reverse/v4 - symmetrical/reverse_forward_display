@@ -8,11 +8,11 @@ img = im2gray(img);
 bscan = double(img).'; % transpose
 
 bscan = [bscan, conj(flip(bscan, 2))];
-figure;
-imagesc(abs(bscan))
-colormap(gray)
-title("Original B-scan")
 
+% figure;
+% imagesc(abs(bscan))
+% colormap(gray)
+% title("Original B-scan")
 
 [num_ascans, num_depth] = size(bscan); % [768x1024]
 signal_length = num_depth;
@@ -33,16 +33,13 @@ og_sig  = zeros(num_ascans, num_depth);
 b_recon = zeros(num_ascans, num_depth);
 mynoise = randn(1, signal_length); % gaussian/white noise with mean = 0, var = 0.01
 mybg = ones(1, signal_length) * mean(bscan, 'all') + mynoise;
-%mybg = zeros(signal_length,1);
-
-%mycp = exp(1i*0.01*pi*rand(1, signal_length))'; % complex phase
 
 
 %% REVERSE PIPELINE (simulate raw from processed image)
 
 for i = 1:num_ascans
     ascan = bscan(i, :);                    % Real data from image
-    s1 = gs_map_r(ascan);
+    s1 = gs_map_r(ascan);                   % Undo greyscale mapping
     s2 = log_sc_r(s1);                      % Convert mag to log space
     s3 = fft_r(s2);                         % IFFT to depth domain
     s4 = disp_c_r(s3, maxmin, a_coeffs);    % Add dispersion
@@ -59,13 +56,12 @@ og_sig = og_sig * scale;
 
 for i = 1:num_ascans
     raw = og_sig(i, :);
-    %s6 = gs_map_f(raw);
-    s7 = bg_sub_f(raw, mybg);               % Remove background
+    s7 = bg_sub_f(raw, mybg);              % Remove background
     s8 = k_lin_f(s7, tvec, kclk);          % Linearize k-space
     s9 = disp_c_f(s8, maxmin, a_coeffs);   % Correct dispersion
     s10 = fft_f(s9);                       % FFT to spatial domain
     s11 = log_sc_f(s10);                   % Log scale magnitude
-    s12 = gs_map_f(s11);
+    s12 = gs_map_f(s11);                   % Undo greyscale mapping
     b_recon(i, :) = s12;
 end
 
@@ -79,7 +75,7 @@ colormap(gray)
 title("Reconstructed B-scan")
 
 figure;
-imagesc(abs(bscan))
+imagesc(bscan(:, 1:512)')
 colormap(gray)
 title("Original B-scan")
 
