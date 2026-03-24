@@ -25,8 +25,8 @@ kclk(1) = 0;
 kclk = round(kclk);
 
 %% OCT PARAMETERS
-maxmin      = [800e-9, 900e-9];
-a_coeffs    = [0, -4 * 10^-11, 0];
+maxmin      = [770e-9, 935e-9];
+a_coeffs    = [0, -4 * 10^-15, 0];
 
 %% STORAGE
 og_sig  = zeros(num_ascans, num_depth);
@@ -152,22 +152,11 @@ function output = fft_r(input)
     output = ifft(input, 'symmetric');
 end
 
-%% -------- LOG SCALING (MAGNITUDE ONLY) --------
+%% -------- LOG SCALING --------
 function output = log_sc_f(input)
-    % Forward: Convert magnitude to dB scale
-    % Input: complex data from FFT
-    % Output: real dB magnitude (magnitude domain)
     output = 20*log10(abs(input));
 end
 
 function output = log_sc_r(input)
-    % Reverse: Convert from linear magnitude to complex
-    % Input: real magnitude values (from image)
-    % Output: complex data (assume zero phase initially)
-    % 
-    % Note: If input is already in dB, convert first:
     output = 10.^(input/20);
-    % If input is linear magnitude:
-    %mag = input;
-    %output = mag + 0i;  % Complex representation with zero phase
 end
