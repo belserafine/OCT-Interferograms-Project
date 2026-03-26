@@ -1,0 +1,298 @@
+"""
+into fpga:
+
+
+out fpga:
+FPGA -> receiver -> parse packet -> assemble slice -> vis_queue -> stream_from_queue -> yield -> append -> Napari
+"""
+
+import threading
+import queue # holds data to be sent and data received
+import socket # UDP for PC-FPGA communication over ethernet
+import time # mainly for sleep()
+import struct
+import numpy as np
+
+# for visualizer
+import dask.array as da # like numpy array but for parallel
+from dask import delayed # to postpone adding layer to viewer
+import napari
+from napari.qt import thread_worker
+
+
+'''
+CONFIGURATION
+'''
+FPGA_IP = "192.168.10.50"
+FPGA_PORT = 5000
+
+PC_BIND_IP = "0.0.0.0"
+PC_BIND_PORT = 5000
+SOCKET_TIMEOUT_SEC = 1
+
+HEADER_MAGIC = 0xFF
+HEADER_DATA = 0xFF
+HEADER_CALI = 0xFE
+
+'''
+SENDING
+'''
+def sender_worker(sock, send_queue, stop_event):
+    """
+    :param sock: UDP socket used to send packets
+    :param send_queue: queue containing outgoing data
+    :param stop_event: a shared signal used to tell the thread to stop
+
+    > takes data from send_queue
+    > converts to UDP packets
+    > send to FPGA
+    """
+    while not stop_event.is_set(): # keep looping until stop_event is triggered
+        try: # try to get item from send_queue and store in item
+            item = send_queue.get(timeout=0.1) # wait up to 0.1 sec only
+        except queue.Empty: # if queue is empty, do nothing
+            continue # go back to start of loop
+
+        try:
+            pass # do nothing for now
+
+        except Exception as e: # print error message
+            print(f"[SEND] error: {e}")
+
+        finally:
+            send_queue.task_done() # mark queue item as finished, meaning sending succeeded or failed
+
+'''
+RECEIVING
+'''
+def parse_packet(pkt: bytes):
+    """
+    Parse one returned FPGA packet.
+    Returns: dict with row_id, batch_id, samples (each row will have 2 batches)
+    """
+    samples_per_packet = 256
+
+    expected_len = 4 + (samples_per_packet * 4) # 1028 bytes
+    if len(pkt) != expected_len:
+        raise ValueError(f"expected {expected_len} bytes, got {len(pkt)}")
+
+    # byte 0-3 -> header fields
+    header_word = struct.unpack("<I", pkt[:4])[0] # take value only from tuple
+
+    magic_header = (header_word >> 24) & 0xFF   # [31:24]
+    msg_type = (header_word >> 16) & 0xFF       # [23:16]
+    batch_id = (header_word >> 14) & 0x3        # [15:14]
+    row_id = header_word & 0x3FF                # [9:0]
+
+    if magic_header != 0xFF:
+        raise ValueError(f"bad magic header: {magic_header:02X}")
+
+    if msg_type != 0x02:  # 0x02 = Data Receive Packets
+        raise ValueError(f"unexpected message type: {msg_type:02X}")
+
+    # byte 4 onwards -> payload
+    payload = pkt[4:]
+
+    samples = [
+        struct.unpack("<i", payload[i:i + 4])[0]
+        for i in range(0, len(payload), 4)
+    ]
+
+    return {
+        "row_id": row_id,
+        "batch_id": batch_id,
+        "samples": samples,
+    }
+
+def receiver_worker(sock, vis_queue, stop_event):
+    """
+    :param sock: UDP socket for receiving
+    :param vis_queue: queue for completed rows to send to visualization
+    :param stop_event: shared shutdown signal
+
+    > listens for returned UDP packets from the FPGA
+    > reassembles them into complete rows
+    > push slices into vis_queue
+    """
+    # ROW = ASCAN, SLICE = BSCAN!
+    packets_per_row = 2
+    rows_per_slice = 768
+
+    partial_rows = {}  # row_id -> {batch_id: samples}
+    slice_rows = []  # completed rows for one slice
+
+    while not stop_event.is_set():
+        try:
+            data, addr = sock.recvfrom(4096) # receiving a batch each time
+            # print(f"Received {len(data)} bytes from {addr}")
+        except socket.timeout: # if socket times out waiting for data
+            continue # it was break
+        except Exception as e:
+            print(f"[RECV] error: {e}")
+            continue
+
+        try:
+            parsed = parse_packet(data)
+
+            row_id = parsed["row_id"]
+            batch_id = parsed["batch_id"]
+            samples = parsed["samples"]
+
+            # create entry for this row if first packet seen
+            if row_id not in partial_rows:
+                partial_rows[row_id] = {}
+
+            # store batch
+            partial_rows[row_id][batch_id] = samples
+
+            # row complete when both batch 0 and batch 1 have arrived
+            if len(partial_rows[row_id]) == packets_per_row: # 2
+                full_row = []
+
+                # combine 2 batches into one a-scan
+                for b in range(packets_per_row):
+                    if b not in partial_rows[row_id]:
+                        raise ValueError(f"missing batch {b} for row {row_id}")
+                    full_row.extend(partial_rows[row_id][b])
+
+                # one a-scan
+                row_1d = np.array(full_row, dtype=np.float32)  # shape (512,)
+
+                del partial_rows[row_id] # delete both batches
+
+                # add this a-scan to slice_rows
+                slice_rows.append(row_1d)
+                print(f"[RECV] completed row {row_id} ({len(slice_rows)}/{rows_per_slice} rows in slice)")
+
+                if len(slice_rows) == rows_per_slice: # 768
+                    slice_2d = np.stack(slice_rows, axis=1)  # shape (512, 768)
+                    vis_queue.put(slice_2d)
+                    print(f"[RECV] pushed completed slice to vis_queue with shape {slice_2d.shape}")
+                    slice_rows.clear()
+
+        except Exception as e:
+            print(f"[RECV] processing error: {e}")
+
+'''
+VISUALIZING
+'''
+def append(new_slice):
+    """
+    Append 2D slices into the z-axis of a single 3D volume.
+    Each queue item should be (768, 512)
+    """
+    if new_slice is None:
+        return # ignore empty data
+
+    # wrap numpy slice as delayed object so stacking stays lazy
+    delayed_image = delayed(lambda x: x)(new_slice)
+
+    # if viewer contains an image layer
+    if viewer.layers:
+
+        # access first layer, get slice dimensions, and datatype
+        layer = viewer.layers[0]
+        yx_shape = layer.data.shape[1:] # (y, x)
+        dtype = layer.data.dtype
+
+        # convert delayed slice into Dask array
+        zslice = da.from_delayed(delayed_image, shape=yx_shape, dtype=dtype)
+
+        # new slice is (y, x) -> make it (1, y, x) so we can concat along z
+        zslice = zslice.reshape((1, *yx_shape)) # add z dimension
+
+        # append to volume
+        # layer.data is (z, y, x)
+        layer.data = da.concatenate((layer.data, zslice), axis=0)
+
+    # if this is the first slice
+    else:
+        first = new_slice
+        delayed_image = delayed(lambda x: x)(first)
+
+        vol = da.from_delayed(delayed_image, shape=first.shape, dtype=first.dtype)
+        vol = vol.reshape((1, *first.shape)) # (y, x) -> (1, y, x)
+
+        # add first image to Napari
+        viewer.add_image(
+            vol,
+            name="OCT Volume",
+            rendering="attenuated_mip",
+            gamma=2, # contrast adjustment
+            scale=(4, 1.0, 1.0) # z spacing correction
+        )
+
+@thread_worker(connect={"yielded": append})
+def stream_from_queue(vis_queue, stop_event):
+    """
+    Read slices from vis_queue and feed into append()
+    Each queue item is expected to be a 2D numpy array of shape (512, 768).
+    """
+    while not stop_event.is_set():
+        try:
+            item = vis_queue.get(timeout=0.1)
+            # queues are FIFO hence we always get the oldest one
+            # once get, its no longer in queue
+        except queue.Empty:
+            continue
+
+        try:
+            arr = np.asarray(item) # ensure slice is np array
+            yield arr.astype(np.float32) # trigger append(arr)
+
+        except Exception as e:
+            print(f"[VIS] error: {e}")
+
+        finally:
+            vis_queue.task_done()
+
+'''
+MAIN
+'''
+def main():
+    global viewer
+
+    stop_event = threading.Event()
+
+    send_queue = queue.Queue()  # outgoing data
+    vis_queue = queue.Queue() # incoming and stacked data
+
+    # UDP socket for receiving FPGA output
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind((PC_BIND_IP, PC_BIND_PORT))
+    sock.settimeout(SOCKET_TIMEOUT_SEC)
+
+    print(f"Bound PC UDP socket to {PC_BIND_IP}:{PC_BIND_PORT}")
+
+    # Sending thread
+    sender_thread = threading.Thread(
+        target=sender_worker,
+        args=(sock, send_queue, stop_event),
+        daemon=True,  # thread will not prevent program exit if main thread (napari) ends
+    )
+    sender_thread.start()
+
+    # Start receiver thread
+    receiver_thread = threading.Thread(
+        target=receiver_worker,
+        args=(sock, vis_queue, stop_event),
+        daemon=True,
+    )
+    receiver_thread.start()
+
+    # Start Napari + queue consumer
+    viewer = napari.Viewer(ndisplay=3)
+
+    vis_worker = stream_from_queue(vis_queue, stop_event)
+    vis_worker.start()
+
+    try:
+        napari.run() # UI on main thread, so it doesnt freeze
+    finally:
+        stop_event.set() # when Napari exits or program ends, the sender, receiver and visual stops
+        receiver_thread.join(timeout=1.0) # wait up to 1 second for receiver thread to finish before closing sock
+        sock.close()
+
+
+if __name__ == "__main__":
+    main()
