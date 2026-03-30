@@ -41,7 +41,7 @@ ROW_SAMPLES_TX = BATCH_SAMPLES * PACKETS_PER_ROW_TX  # transmitting
 
 ROWS_PER_SLICE = 768
 
-INTER_PACKET_DELAY_SEC = 0.0
+INTER_PACKET_DELAY_SEC = 3
 
 HEADER_MAGIC = 0xFF
 HEADER_DATA = 0x01
@@ -53,19 +53,20 @@ PRODUCER
 '''
 def producer_worker(send_queue, stop_event):
     """
-    Loads calibration + raw data and pushes rows into send_queue.
+    Loads calibration + raw data and pushes rows into send_queue
     Queue item format: (row_id, row_samples, source)
     """
-
+    print("[PROD] in producer worker")
+    '''
     ### CALIBRATION ###
     try:
         # Load mat file
-        calib_data = scipy.io.loadmat(r"C:\Users\Harin\OneDrive\Capstone\calibration_data.mat")
+        calib_data = scipy.io.loadmat(r"/Users/belindaserafine/Documents/School/Capstone/jpg/v5/bin/calibration_data.mat")
         # print(calib_data.keys())
         bg_row = calib_data['mybg'].astype(np.int32) # shape (1, 1024)
 
         # Load dummy mat file
-        calib_dummy = scipy.io.loadmat(r"C:\Users\Harin\OneDrive\Capstone\calibration_dummy.mat")
+        calib_dummy = scipy.io.loadmat(r"/Users/belindaserafine/Documents/School/Capstone/jpg/v5/bin/DummyCalibData.m")
         # print(calib_dummy.keys())
         k_rows = calib_dummy['k'].astype(np.int32) # shape (5, 1024)
         disp_rows = calib_dummy['disp'].astype(np.int32) # shape (2, 1024)
@@ -85,10 +86,10 @@ def producer_worker(send_queue, stop_event):
 
     except Exception as e:
         print(f"[PROD] calibration error: {e}")
-
-    # ---- RAW DATA ----
+    '''
+    ### RAW DATA ###
     try:
-        files = sorted(glob.glob(r"C:\Users\Harin\OneDrive\Capstone\raw_signals_optimal*.bin"))
+        files = sorted(glob.glob(r"/Users/belindaserafine/Documents/School/Capstone/jpg/v5/bin/raw_signals_optimal_a2_*.bin"))
 
         for file in files:
             if stop_event.is_set():
@@ -192,11 +193,12 @@ def sender_worker(sock, send_queue, stop_event):
 
                 pkt = build_packet(row_id, batch_id, msg_type, batch_samples)
                 sock.sendto(pkt, (FPGA_IP, FPGA_PORT))
+                #print(f"[SEND BATCH] sent batch={batch_id} source={source}")
 
                 if INTER_PACKET_DELAY_SEC > 0:
                     time.sleep(INTER_PACKET_DELAY_SEC)
 
-            print(f"[SEND] sent row={row_id} source={source}")
+            print(f"[SEND ROW] sent row={row_id} source={source}")
 
         except Exception as e: # print error message
             print(f"[SEND] error: {e}")
@@ -263,7 +265,7 @@ def receiver_worker(sock, vis_queue, stop_event):
     while not stop_event.is_set():
         try:
             data, addr = sock.recvfrom(4096) # receiving a batch each time
-            # print(f"Received {len(data)} bytes from {addr}")
+            print(f"Received {len(data)} bytes from {addr}")
         except socket.timeout: # if socket times out waiting for data
             continue # it was break
         except Exception as e:
@@ -404,7 +406,25 @@ def main():
 
     print(f"Bound PC UDP socket to {PC_BIND_IP}:{PC_BIND_PORT}")
 
+    # Start Napari + queue consumer
+    print("[MAIN] creating viewer...")
+    viewer = napari.Viewer(ndisplay=3)
+    print("[MAIN] viewer created")
+
+    print("[MAIN] starting vis_worker...")
+    vis_worker = stream_from_queue(vis_queue, stop_event) # already starts the worker by default
+    print("[MAIN] vis_worker started")
+
     ### THREADS ###
+    # Start producer thread
+    producer_thread = threading.Thread(
+        target=producer_worker,
+        args=(send_queue, stop_event),
+        daemon=True,
+    )
+    producer_thread.start()
+    print("[MAIN] producer_thread started")
+
     # Start sender thread
     sender_thread = threading.Thread(
         target=sender_worker,
@@ -412,6 +432,7 @@ def main():
         daemon=True,  # thread will not prevent program exit if main thread (napari) ends
     )
     sender_thread.start()
+    print("[MAIN] sender_thread started")
 
     # Start receiver thread
     receiver_thread = threading.Thread(
@@ -420,20 +441,7 @@ def main():
         daemon=True,
     )
     receiver_thread.start()
-
-    # Start producer thread
-    producer_thread = threading.Thread(
-        target=producer_worker,
-        args=(send_queue, stop_event),
-        daemon=True,
-    )
-    producer_thread.start()
-
-    # Start Napari + queue consumer
-    viewer = napari.Viewer(ndisplay=3)
-
-    vis_worker = stream_from_queue(vis_queue, stop_event)
-    vis_worker.start()
+    print("[MAIN] receiver_thread started")
 
     try:
         napari.run() # UI on main thread, so it doesn't freeze
