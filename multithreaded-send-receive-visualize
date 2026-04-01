@@ -32,7 +32,7 @@ FPGA_PORT = 5001
 
 PC_BIND_IP = "0.0.0.0"
 PC_BIND_PORT = 5001
-SOCKET_TIMEOUT_SEC = 1
+SOCKET_TIMEOUT_SEC = 5
 
 BATCH_SAMPLES = 256
 PACKETS_PER_ROW_TX = 4 # transmitting/sending
@@ -41,7 +41,7 @@ ROW_SAMPLES_TX = BATCH_SAMPLES * PACKETS_PER_ROW_TX  # transmitting
 
 ROWS_PER_SLICE = 768
 
-INTER_PACKET_DELAY_SEC = 3
+INTER_PACKET_DELAY_SEC = 0.0001 # its too fast on my mac ?? needs to have delay cant be 0
 
 HEADER_MAGIC = 0xFF
 HEADER_DATA = 0x01
@@ -56,7 +56,7 @@ def producer_worker(send_queue, stop_event):
     Loads calibration + raw data and pushes rows into send_queue
     Queue item format: (row_id, row_samples, source)
     """
-    print("[PROD] in producer worker")
+
     '''
     ### CALIBRATION ###
     try:
@@ -77,7 +77,7 @@ def producer_worker(send_queue, stop_event):
         # cuz we want specific row ids for each calibration data row
         calib_row_ids = [0] + list(range(24, 29)) + [20, 21]
 
-        for row_samples, row_id in zip(calibration_rows, calib_row_ids): # TODO: DOES CALIB NEED ROW_ID? wait how does that work idk
+        for row_samples, row_id in zip(calibration_rows, calib_row_ids):
             if stop_event.is_set():
                 return
             row_samples = row_samples.astype(np.int32)  # just in case lmao
@@ -89,16 +89,18 @@ def producer_worker(send_queue, stop_event):
     '''
     ### RAW DATA ###
     try:
-        files = sorted(glob.glob(r"/Users/belindaserafine/Documents/School/Capstone/jpg/v5/bin/raw_signals_optimal_a2_*.bin"))
+        files = sorted(glob.glob(r'/Users/belindaserafine/Documents/School/Capstone/Capstone Datasets/bins of original (duplicate every col)/original_bscan_*.bin'))
 
-        for file in files:
+        for file_idx, file in enumerate(files):
             if stop_event.is_set():
                 return
 
             print(f"[PROD] loading file {file}")
 
             real_data = np.fromfile(file, dtype="<i4")
-            rows = real_data.reshape(768, 1024) # split into rows of ROW_SAMPLES
+            rows = real_data.reshape((768, 1024), order='F') # CHANGE WAS HERE
+
+            row_count = 0
 
             # FOR THIS FILE, SEND EACH ROW IN THE BATCHES
             for row_id, row_samples in enumerate(rows):
@@ -106,8 +108,9 @@ def producer_worker(send_queue, stop_event):
                     return
 
                 send_queue.put((row_id, row_samples, "raw"))
+                row_count += 1
 
-            print(f"[PROD] finished file {file}")
+            print(f"[PROD] file {file_idx + 1}/{len(files)} queued: {row_count} rows")
 
     except Exception as e:
         print(f"[PROD] raw data error: {e}")
@@ -130,13 +133,13 @@ def build_header(row_id: int, batch_id: int, msg_type: int) -> bytes:
             | ((batch_id & 0x3) << 14)
             | (row_id & 0x3FF)
     )
-    print(f"Sending header=0x{header_word:08X}")
+    #print(f"Sending header=0x{header_word:08X}")
     return struct.pack("<I", header_word)
 
 
 def build_payload(samples):
     if len(samples) != BATCH_SAMPLES:
-        raise ValueError(f"payload must contain exactly {BATCH_SAMPLES} complex samples")
+        raise ValueError(f"payload must contain exactly {BATCH_SAMPLES} samples")
 
     payload = bytearray()
 
@@ -157,11 +160,9 @@ def sender_worker(sock, send_queue, stop_event):
     :param send_queue: queue containing outgoing data
     :param stop_event: a shared signal used to tell the thread to stop
 
-    > takes data from send_queue
-    > converts to UDP packets
-    > send to FPGA
+    Takes data from send_queue, converts it to UDP packets, and sends it to FPGA.
 
-    Format of item from send_queue:
+    Queue item format:
         (row_id, row_samples, source)
 
     where:
@@ -169,21 +170,33 @@ def sender_worker(sock, send_queue, stop_event):
         row_samples: array-like of length 1024
         source: "raw" or "calib"
     """
-    while not stop_event.is_set(): # keep looping until stop_event is triggered
-        try: # try to get item from send_queue and store in item
-            item = send_queue.get(timeout=0.1) # FIFO and wait up to 0.1 sec only
-        except queue.Empty: # if queue is empty, do nothing
-            continue # go back to start of loop
+    total_rows_sent = 0
+    current_file_row_count = 0
+    last_row_id = None
+    file_index_est = 0
+
+    while not stop_event.is_set():
+        try:
+            item = send_queue.get(timeout=0.1)
+        except queue.Empty:
+            continue
 
         try:
             row_id, row_samples, source = item
-
             row_samples = np.asarray(row_samples, dtype=np.int32).reshape(-1)
 
             if len(row_samples) != ROW_SAMPLES_TX:
                 raise ValueError(f"row must contain exactly {ROW_SAMPLES_TX} samples")
 
             msg_type = HEADER_CALI if source == "calib" else HEADER_DATA
+
+            # Detect new raw file when row_id resets from something else back to 0
+            if source == "raw" and last_row_id is not None and row_id == 0 and last_row_id != 0:
+                print(
+                    f"[SEND FILE DONE] file {file_index_est} sent: "
+                    f"{current_file_row_count} rows"
+                )
+                current_file_row_count = 0
 
             # Send 4 packets: batch 0,1,2,3
             for batch_id in range(PACKETS_PER_ROW_TX):
@@ -193,18 +206,44 @@ def sender_worker(sock, send_queue, stop_event):
 
                 pkt = build_packet(row_id, batch_id, msg_type, batch_samples)
                 sock.sendto(pkt, (FPGA_IP, FPGA_PORT))
-                #print(f"[SEND BATCH] sent batch={batch_id} source={source}")
 
                 if INTER_PACKET_DELAY_SEC > 0:
                     time.sleep(INTER_PACKET_DELAY_SEC)
 
-            print(f"[SEND ROW] sent row={row_id} source={source}")
+            total_rows_sent += 1
 
-        except Exception as e: # print error message
+            if source == "raw":
+                if row_id == 0 and (last_row_id is None or last_row_id != 0):
+                    file_index_est += 1
+                    print(f"[SEND FILE START] file {file_index_est} starting")
+
+                current_file_row_count += 1
+
+                print(
+                    f"[SEND ROW] source=raw file={file_index_est} "
+                    f"row={row_id} file_rows_sent={current_file_row_count}/{ROWS_PER_SLICE} "
+                    f"total_rows_sent={total_rows_sent}"
+                )
+
+                if current_file_row_count == ROWS_PER_SLICE:
+                    print(
+                        f"[SEND FILE DONE] file {file_index_est} sent full file: "
+                        f"{current_file_row_count} rows"
+                    )
+
+            else:
+                print(
+                    f"[SEND ROW] source=calib row={row_id} "
+                    f"total_rows_sent={total_rows_sent}"
+                )
+
+            last_row_id = row_id
+
+        except Exception as e:
             print(f"[SEND] error: {e}")
 
         finally:
-            send_queue.task_done() # mark queue item as finished
+            send_queue.task_done()
 
 '''
 RECEIVING
@@ -227,10 +266,12 @@ def parse_packet(pkt: bytes):
     batch_id = (header_word >> 14) & 0x3        # [15:14]
     row_id = header_word & 0x3FF                # [9:0]
 
+    print(f"[RECV HDR] raw=0x{header_word:08X} type=0x{msg_type:02X} batch={batch_id} row={row_id}")
+
     if magic_header != 0xFF:
         raise ValueError(f"bad magic header: {magic_header:02X}")
 
-    if msg_type != 0x02:  # 0x02 = Data Receive Packets
+    if msg_type != 0x03:  # 0x03 = Data Receive Packets
         raise ValueError(f"unexpected message type: {msg_type:02X}")
 
     # byte 4 onwards -> payload
@@ -267,7 +308,8 @@ def receiver_worker(sock, vis_queue, stop_event):
             data, addr = sock.recvfrom(4096) # receiving a batch each time
             print(f"Received {len(data)} bytes from {addr}")
         except socket.timeout: # if socket times out waiting for data
-            continue # it was break
+            # print("[RECV] socket timeout, still waiting...")
+            continue
         except Exception as e:
             print(f"[RECV] error: {e}")
             continue
@@ -285,6 +327,8 @@ def receiver_worker(sock, vis_queue, stop_event):
 
             # store batch
             partial_rows[row_id][batch_id] = samples
+
+            print(f"[RECV DBG] row={row_id} batches_seen={sorted(partial_rows[row_id].keys())}")
 
             # row complete when both batch 0 and batch 1 have arrived
             if len(partial_rows[row_id]) == PACKETS_PER_ROW_RX: # 2
@@ -322,8 +366,12 @@ def append(new_slice):
     Append 2D slices into the z-axis of a single 3D volume.
     Each queue item should be (768, 512)
     """
+    # new_slice = new_slice.T
+
     if new_slice is None:
         return # ignore empty data
+
+    print(f"[VIS] visualizing slice with shape: {new_slice.shape}")
 
     # wrap numpy slice as delayed object so stacking stays lazy
     delayed_image = delayed(lambda x: x)(new_slice)
@@ -344,7 +392,7 @@ def append(new_slice):
 
         # append to volume
         # layer.data is (z, y, x)
-        layer.data = da.concatenate((layer.data, zslice), axis=0)
+        layer.data = da.concatenate((layer.data.compute(), zslice.compute()), axis=0)
 
     # if this is the first slice
     else:
