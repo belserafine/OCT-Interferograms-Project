@@ -1,0 +1,241 @@
+import socket
+import struct
+import time
+import numpy as np
+import os
+
+FPGA_IP = "192.168.10.50"
+FPGA_PORT = 5001
+
+PC_BIND_IP = "0.0.0.0"
+PC_BIND_PORT = 5001
+SOCKET_TIMEOUT_SEC = 2.0
+INTER_PACKET_DELAY_SEC = 0.0
+
+BATCH_SAMPLES_TX = 256
+PACKETS_PER_ROW_TX = 4
+ROW_SAMPLES_TX = BATCH_SAMPLES_TX * PACKETS_PER_ROW_TX  # 1024 samples sent
+
+BATCH_SAMPLES_RX = 256
+PACKETS_PER_ROW_RX = 2
+ROW_SAMPLES_RX = BATCH_SAMPLES_RX * PACKETS_PER_ROW_RX  # 512 samples received
+
+HEADER_MAGIC = 0xFF
+HEADER_DATA = 0x01
+HEADER_CALI = 0x02
+HEADER_REPLY = 0x03
+
+
+# =========================
+# TX helpers
+# =========================
+def build_header(row_id: int, batch_id: int, msg_type: int) -> bytes:
+    if not (0 <= row_id < 768):
+        raise ValueError("row_id must be 0..767")
+    if not (0 <= batch_id < 4):
+        raise ValueError("batch_id must be 0..3")
+    if msg_type not in (HEADER_DATA, HEADER_CALI):
+        raise ValueError("Invalid message type")
+
+    header_word = (
+        (HEADER_MAGIC << 24)
+        | (msg_type << 16)
+        | ((batch_id & 0x3) << 14)
+        | (row_id & 0x3FF)
+    )
+    return struct.pack("<I", header_word)
+
+
+def build_payload(samples: np.ndarray) -> bytes:
+    if len(samples) != BATCH_SAMPLES_TX:
+        raise ValueError(f"payload must contain exactly {BATCH_SAMPLES_TX} samples")
+
+    payload = bytearray()
+    for sample in samples:
+        payload += struct.pack("<i", int(sample))
+    return bytes(payload)
+
+
+def build_packet(row_id: int, batch_id: int, msg_type: int, samples: np.ndarray) -> bytes:
+    return build_header(row_id, batch_id, msg_type) + build_payload(samples)
+
+
+# =========================
+# RX helpers
+# =========================
+def parse_packet(pkt: bytes):
+    expected_len = 4 + (BATCH_SAMPLES_RX * 4)  # 4-byte header + 256 int32 = 1028 bytes
+    if len(pkt) != expected_len:
+        raise ValueError(f"expected {expected_len} bytes, got {len(pkt)}")
+
+    header_word = struct.unpack("<I", pkt[:4])[0]
+
+    magic_hi = (header_word >> 24) & 0xFF
+    magic_lo = (header_word >> 16) & 0xFF
+    batch_id = (header_word >> 14) & 0x3
+    row_id = header_word & 0x3FF
+
+    if magic_hi != HEADER_MAGIC or magic_lo != HEADER_REPLY:
+        raise ValueError(f"bad header magic: hi=0x{magic_hi:02X}, lo=0x{magic_lo:02X}")
+
+    payload = pkt[4:]
+    samples = np.frombuffer(payload, dtype="<i4").copy()
+
+    if len(samples) != BATCH_SAMPLES_RX:
+        raise ValueError(f"expected {BATCH_SAMPLES_RX} samples, got {len(samples)}")
+
+    return {
+        "row_id": row_id,
+        "batch_id": batch_id,
+        "samples": samples,
+    }
+
+
+def combine_replies_to_row(replies: dict) -> np.ndarray:
+    """
+    Combine reply batches 0 and 1 into one 512-sample output row.
+    """
+    missing = [b for b in range(PACKETS_PER_ROW_RX) if b not in replies]
+    if missing:
+        raise ValueError(f"missing reply batches: {missing}")
+
+    ordered = [replies[b]["samples"] for b in range(PACKETS_PER_ROW_RX)]
+    return np.concatenate(ordered)
+
+
+# =========================
+# Main send/receive
+# =========================
+def send_row_and_receive_reply(sock, row_id: int, row_samples: np.ndarray, source="raw"):
+    if len(row_samples) != ROW_SAMPLES_TX:
+        raise ValueError(f"row must contain exactly {ROW_SAMPLES_TX} samples")
+
+    msg_type = HEADER_CALI if source == "calib" else HEADER_DATA
+
+    # send 4 TX packets of 256 each
+    for batch_id in range(PACKETS_PER_ROW_TX):
+        start = batch_id * BATCH_SAMPLES_TX
+        end = start + BATCH_SAMPLES_TX
+        batch_samples = row_samples[start:end]
+
+        pkt = build_packet(row_id, batch_id, msg_type, batch_samples)
+        print(f"[SEND] row={row_id} batch={batch_id} bytes={len(pkt)}")
+        sock.sendto(pkt, (FPGA_IP, FPGA_PORT))
+        time.sleep(INTER_PACKET_DELAY_SEC)
+
+    # receive 2 RX packets of 256 each
+    replies = {}
+    deadline = time.time() + SOCKET_TIMEOUT_SEC
+
+    while len(replies) < PACKETS_PER_ROW_RX and time.time() < deadline:
+        remaining = max(0.01, deadline - time.time())
+        sock.settimeout(remaining)
+
+        try:
+            data, addr = sock.recvfrom(4096)
+        except socket.timeout:
+            break
+        except BlockingIOError:
+            continue
+
+        print(f"[RECV] got {len(data)} bytes from {addr}")
+
+        try:
+            parsed = parse_packet(data)
+        except Exception as e:
+            print(f"[RECV] ignoring malformed packet: {e}")
+            continue
+
+        if parsed["row_id"] != row_id:
+            print(f"[RECV] ignoring unexpected row_id={parsed['row_id']} (expected {row_id})")
+            continue
+
+        replies[parsed["batch_id"]] = parsed
+        print(
+            f"[RECV] accepted row={parsed['row_id']} "
+            f"batch={parsed['batch_id']} "
+            f"first8={parsed['samples'][:8].tolist()}"
+        )
+
+    return replies
+
+
+# =========================
+# Debug print helper
+# =========================
+def print_fpga_output(input_row: np.ndarray, output_row: np.ndarray):
+    print("\n" + "=" * 80)
+    print("INPUT ROW SUMMARY")
+    print("=" * 80)
+    print(f"Input length: {len(input_row)}")
+    print(f"First 16 input samples: {input_row[:16].tolist()}")
+    print(f"Last 16 input samples:  {input_row[-16:].tolist()}")
+
+    print("\n" + "=" * 80)
+    print("FPGA OUTPUT SUMMARY")
+    print("=" * 80)
+    print(f"Output length: {len(output_row)}")
+    print(f"First 16 output samples: {output_row[:16].tolist()}")
+    print(f"Last 16 output samples:  {output_row[-16:].tolist()}")
+
+    print("\nFull 512-sample FPGA output:")
+    for i, val in enumerate(output_row):
+        print(f"out[{i:03d}] = {int(val)}")
+
+
+# =========================
+# Single-row test
+# =========================
+def main():
+    test_file = r"/Users/belindaserafine/Documents/School/Capstone/Capstone Datasets/test_array_1d.bin"
+    row_id = 0
+
+    # load exactly 1 x 1024 int32 input
+    raw = np.fromfile(test_file, dtype="<i4")
+
+    if len(raw) != ROW_SAMPLES_TX:
+        raise ValueError(
+            f"{os.path.basename(test_file)} must contain exactly "
+            f"{ROW_SAMPLES_TX} int32 values, got {len(raw)}"
+        )
+
+    input_row = raw.astype(np.int32)
+
+    print(f"Loaded file: {test_file}")
+    print(f"Input row length = {len(input_row)}")
+
+    # optional sanity check for your test pattern
+    if np.array_equal(input_row, np.arange(1, 1025, dtype=np.int32)):
+        print("Input pattern verified: increments from 1 to 1024")
+    else:
+        print("Warning: input is not exactly [1, 2, ..., 1024]")
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind((PC_BIND_IP, PC_BIND_PORT))
+    print(f"Bound to {PC_BIND_IP}:{PC_BIND_PORT}")
+    print(f"Sending to FPGA at {FPGA_IP}:{FPGA_PORT}")
+
+    try:
+        replies = send_row_and_receive_reply(sock, row_id, input_row, source="raw")
+
+        print(f"\nReceived {len(replies)}/{PACKETS_PER_ROW_RX} reply packets")
+
+        if len(replies) != PACKETS_PER_ROW_RX:
+            print("Did not receive full FPGA output.")
+            for batch_id in sorted(replies.keys()):
+                pkt = replies[batch_id]
+                print(
+                    f"Partial reply batch {batch_id}: "
+                    f"row={pkt['row_id']} first8={pkt['samples'][:8].tolist()}"
+                )
+            return
+
+        output_row = combine_replies_to_row(replies)
+        print_fpga_output(input_row, output_row)
+
+    finally:
+        sock.close()
+
+
+if __name__ == "__main__":
+    main()
