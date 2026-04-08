@@ -1,0 +1,58 @@
+clear; clc;
+
+og_folder = '/Users/belindaserafine/Documents/School/Capstone/Capstone Datasets/bin of original';
+pc_folder = '/Users/belindaserafine/PycharmProjects/Capstone3.12';
+fpga_folder = 'FPGA';
+
+num_ascans = 512;
+num_depth  = 768;
+num_files = 31;
+
+og_files = dir(fullfile(og_folder, '*.bin'));
+pc_files = dir(fullfile(pc_folder, '*.bin'));
+%fpga_files = dir(fullfile(fpga_folder, '*.bin'));
+
+snr_vals = zeros(1, num_files); % storage
+err_vals = zeros(1, num_files); % storage
+
+for i = 1:31
+    full_path = fullfile(og_folder, og_files(i).name);
+    % disp(full_path);
+
+    fid = fopen(full_path, 'rb');
+    img = fread(fid, num_ascans * num_depth, 'int32');
+    fclose(fid);
+    og_bscan = reshape(img, num_ascans, num_depth);
+
+    % figure;
+    % imagesc(bscan);
+    % colormap gray;
+    % title('og');
+
+    full_path = fullfile(pc_folder, pc_files(i).name);
+    % disp(full_path);
+
+    fid = fopen(full_path, 'rb');
+    img = fread(fid, num_ascans * num_depth, "int32");
+    fclose(fid);
+    pc_bscan = reshape(img, num_depth, num_ascans);
+    pc_bscan = pc_bscan.';
+    
+    % figure;
+    % imagesc(bscan);
+    % colormap gray;
+    % title('pc');
+
+    % compute snr
+    snr_vals(i) = snr(pc_bscan, og_bscan);
+
+    % error
+    err_vals(i) = norm(abs(pc_bscan(:)) - abs(og_bscan(:))) / norm(abs(og_bscan(:)));
+end
+
+% compute average
+avg_snr = mean(snr_vals);
+avg_err = mean(err_vals);
+
+fprintf('Average SNR = %.3f dB\n', avg_snr);
+fprintf('Relative reconstruction error = %.3f \n', avg_err);
